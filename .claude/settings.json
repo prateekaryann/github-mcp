@@ -1,0 +1,25 @@
+{
+  "project": {
+    "name": "github-mcp",
+    "type": "mcp-server",
+    "language": "python",
+    "python_version": "3.10+"
+  },
+  "development": {
+    "venv_path": "./venv",
+    "entry_point": "server.py",
+    "run_command": "python server.py"
+  },
+  "preferences": {
+    "code_style": "black",
+    "type_checking": "strict",
+    "single_file_server": true
+  },
+  "dependencies": {
+    "external": ["gh", "git"]
+  },
+  "integrations": {
+    "claude_desktop": true,
+    "github_cli": true
+  }
+}
