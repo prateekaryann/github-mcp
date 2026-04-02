@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import base64
 import subprocess
 import json
 import os
@@ -27,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("github-cli")
 
 # Default working directory for git operations
-WORK_DIR = Path.home() / "projects"
+WORK_DIR = Path(os.environ.get("WORK_DIR", str(Path.home() / "projects")))
 
 
 def run_gh(args: list[str], cwd: Optional[str] = None) -> dict:
@@ -128,6 +129,26 @@ def whoami() -> str:
         return f"Error: {result['error']}"
 
 
+@mcp.tool()
+def switch_account(username: str) -> str:
+    """
+    Switch the active GitHub CLI account.
+
+    Args:
+        username: GitHub username to switch to (must already be authenticated via gh auth login)
+
+    Returns:
+        Confirmation of the switch with current auth status
+    """
+    result = run_gh(["auth", "switch", "--user", username])
+
+    if result["success"]:
+        status = run_gh(["auth", "status"])
+        return f"✅ Switched to {username}\n\n{status['output']}"
+    else:
+        return f"❌ Failed to switch account: {result['error']}"
+
+
 # =============================================================================
 # REPOSITORY OPERATIONS
 # =============================================================================
@@ -190,19 +211,32 @@ def list_repos(
         List of repositories
     """
     args = ["repo", "list"]
-    
+
     if owner:
         args.append(owner)
-    
+
     args.extend(["--limit", str(limit)])
-    
+
     if visibility != "all":
         args.extend(["--visibility", visibility])
-    
+
+    args.extend(["--json", "name,description,visibility,updatedAt"])
+
     result = run_gh(args)
-    
+
     if result["success"]:
-        return f"📁 Repositories:\n\n{result['output']}"
+        try:
+            repos = json.loads(result["output"])
+            lines = []
+            for r in repos:
+                desc = r.get("description") or "No description"
+                vis = r.get("visibility", "").upper()
+                updated = r.get("updatedAt", "")[:10]
+                lines.append(f"  {r['name']} ({vis}) - {desc} [updated: {updated}]")
+            formatted = "\n".join(lines) if lines else "No repositories found."
+            return f"📁 Repositories:\n\n{formatted}"
+        except (json.JSONDecodeError, KeyError):
+            return f"📁 Repositories:\n\n{result['output']}"
     else:
         return f"Error: {result['error']}"
 
@@ -451,6 +485,150 @@ def git_pull(repo_path: str, branch: str = "main") -> str:
 
 
 # =============================================================================
+# BRANCH OPERATIONS
+# =============================================================================
+
+@mcp.tool()
+def create_branch(
+    repo_path: str,
+    branch_name: str,
+    from_branch: str = "main",
+) -> str:
+    """
+    Create a new git branch.
+
+    Args:
+        repo_path: Path to the local repository
+        branch_name: Name for the new branch
+        from_branch: Branch to create from (default: 'main')
+
+    Returns:
+        Success message or error
+    """
+    result = run_git(["checkout", "-b", branch_name, from_branch], cwd=repo_path)
+
+    if result["success"]:
+        return f"✅ Created and switched to branch '{branch_name}' (from '{from_branch}')"
+    else:
+        return f"❌ Failed to create branch: {result['error']}"
+
+
+@mcp.tool()
+def list_branches(repo_path: str) -> str:
+    """
+    List all local branches, marking the current one.
+
+    Args:
+        repo_path: Path to the local repository
+
+    Returns:
+        List of branches with current branch marked
+    """
+    result = run_git(["branch"], cwd=repo_path)
+
+    if result["success"]:
+        return f"🔀 Branches:\n\n{result['output']}"
+    else:
+        return f"❌ Failed to list branches: {result['error']}"
+
+
+@mcp.tool()
+def switch_branch(repo_path: str, branch_name: str) -> str:
+    """
+    Switch to (checkout) a branch.
+
+    Args:
+        repo_path: Path to the local repository
+        branch_name: Branch to switch to
+
+    Returns:
+        Success message or error
+    """
+    result = run_git(["checkout", branch_name], cwd=repo_path)
+
+    if result["success"]:
+        return f"✅ Switched to branch '{branch_name}'"
+    else:
+        return f"❌ Failed to switch branch: {result['error']}"
+
+
+@mcp.tool()
+def delete_branch(
+    repo_path: str,
+    branch_name: str,
+    force: bool = False,
+) -> str:
+    """
+    Delete a local branch.
+
+    Args:
+        repo_path: Path to the local repository
+        branch_name: Branch to delete
+        force: Force delete even if not fully merged (default: False)
+
+    Returns:
+        Success message or error
+    """
+    flag = "-D" if force else "-d"
+    result = run_git(["branch", flag, branch_name], cwd=repo_path)
+
+    if result["success"]:
+        return f"✅ Deleted branch '{branch_name}'"
+    else:
+        return f"❌ Failed to delete branch: {result['error']}"
+
+
+# =============================================================================
+# FORK OPERATIONS
+# =============================================================================
+
+@mcp.tool()
+def fork_repo(repo: str, clone: bool = False) -> str:
+    """
+    Fork a GitHub repository to your account.
+
+    Args:
+        repo: Repository in 'owner/repo' format (e.g., 'facebook/react')
+        clone: Whether to clone the fork locally after creation (default: False)
+
+    Returns:
+        Success message with fork info or error
+    """
+    args = ["repo", "fork", repo]
+
+    if clone:
+        args.append("--clone")
+    else:
+        args.append("--clone=false")
+
+    result = run_gh(args)
+
+    if result["success"]:
+        return f"✅ Forked {repo}!\n\n{result['output']}"
+    else:
+        return f"❌ Failed to fork repository\n\n{result['error']}"
+
+
+@mcp.tool()
+def sync_fork(repo_path: str) -> str:
+    """
+    Sync a forked repository with its upstream (parent) repository.
+
+    Args:
+        repo_path: Path to the local fork repository
+
+    Returns:
+        Success message or error
+    """
+    result = run_gh(["repo", "sync"], cwd=repo_path)
+
+    if result["success"]:
+        return f"✅ Fork synced with upstream!\n\n{result['output']}"
+    else:
+        return f"❌ Failed to sync fork\n\n{result['error']}"
+
+
+# =============================================================================
 # ISSUES
 # =============================================================================
 
@@ -507,13 +685,51 @@ def list_issues(
         List of issues
     """
     args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit)]
-    
+    args.extend(["--json", "number,title,state,author,createdAt"])
+
     result = run_gh(args)
-    
+
     if result["success"]:
-        return f"📋 Issues ({state}):\n\n{result['output']}"
+        try:
+            issues = json.loads(result["output"])
+            lines = []
+            for i in issues:
+                author = i.get("author", {}).get("login", "unknown") if isinstance(i.get("author"), dict) else "unknown"
+                created = i.get("createdAt", "")[:10]
+                lines.append(f"  #{i['number']} [{i['state']}] {i['title']} (by {author}, {created})")
+            formatted = "\n".join(lines) if lines else "No issues found."
+            return f"📋 Issues ({state}):\n\n{formatted}"
+        except (json.JSONDecodeError, KeyError):
+            return f"📋 Issues ({state}):\n\n{result['output']}"
     else:
         return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def comment_on_issue(
+    repo: str,
+    issue_number: int,
+    body: str,
+) -> str:
+    """
+    Add a comment to an issue.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        issue_number: Issue number to comment on
+        body: Comment text
+
+    Returns:
+        Success message or error
+    """
+    args = ["issue", "comment", str(issue_number), "--repo", repo, "--body", body]
+
+    result = run_gh(args)
+
+    if result["success"]:
+        return f"✅ Comment added to issue #{issue_number}\n\n{result['output']}"
+    else:
+        return f"❌ Failed to comment on issue: {result['error']}"
 
 
 # =============================================================================
@@ -577,13 +793,271 @@ def list_prs(
         limit: Maximum number of PRs to list
     """
     args = ["pr", "list", "--repo", repo, "--state", state, "--limit", str(limit)]
-    
+    args.extend(["--json", "number,title,state,author,createdAt"])
+
     result = run_gh(args)
-    
+
     if result["success"]:
-        return f"🔀 Pull Requests ({state}):\n\n{result['output']}"
+        try:
+            prs = json.loads(result["output"])
+            lines = []
+            for p in prs:
+                author = p.get("author", {}).get("login", "unknown") if isinstance(p.get("author"), dict) else "unknown"
+                created = p.get("createdAt", "")[:10]
+                lines.append(f"  #{p['number']} [{p['state']}] {p['title']} (by {author}, {created})")
+            formatted = "\n".join(lines) if lines else "No pull requests found."
+            return f"🔀 Pull Requests ({state}):\n\n{formatted}"
+        except (json.JSONDecodeError, KeyError):
+            return f"🔀 Pull Requests ({state}):\n\n{result['output']}"
     else:
         return f"Error: {result['error']}"
+
+
+@mcp.tool()
+def comment_on_pr(
+    repo: str,
+    pr_number: int,
+    body: str,
+) -> str:
+    """
+    Add a comment to a pull request.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        pr_number: Pull request number to comment on
+        body: Comment text
+
+    Returns:
+        Success message or error
+    """
+    args = ["pr", "comment", str(pr_number), "--repo", repo, "--body", body]
+
+    result = run_gh(args)
+
+    if result["success"]:
+        return f"✅ Comment added to PR #{pr_number}\n\n{result['output']}"
+    else:
+        return f"❌ Failed to comment on PR: {result['error']}"
+
+
+# =============================================================================
+# COLLABORATORS
+# =============================================================================
+
+@mcp.tool()
+def list_collaborators(repo: str) -> str:
+    """
+    List collaborators for a GitHub repository.
+
+    Args:
+        repo: Repository in 'owner/repo' format (e.g., 'prateekaryann/github-mcp')
+
+    Returns:
+        List of collaborator usernames
+    """
+    result = run_gh(["api", f"repos/{repo}/collaborators", "--jq", ".[].login"])
+
+    if result["success"]:
+        return f"👥 Collaborators for {repo}:\n\n{result['output']}"
+    else:
+        return f"❌ Failed to list collaborators: {result['error']}"
+
+
+@mcp.tool()
+def add_collaborator(
+    repo: str,
+    username: str,
+    permission: str = "push",
+) -> str:
+    """
+    Add a collaborator to a GitHub repository.
+
+    Args:
+        repo: Repository in 'owner/repo' format (e.g., 'prateekaryann/github-mcp')
+        username: GitHub username to add as collaborator
+        permission: Permission level - 'pull', 'push', 'admin' (default: 'push')
+
+    Returns:
+        Success message or error
+    """
+    result = run_gh([
+        "api", "-X", "PUT",
+        f"repos/{repo}/collaborators/{username}",
+        "-f", f"permission={permission}",
+    ])
+
+    if result["success"]:
+        return f"✅ Added {username} as collaborator to {repo} with '{permission}' permission"
+    else:
+        return f"❌ Failed to add collaborator: {result['error']}"
+
+
+# =============================================================================
+# FILE OPERATIONS
+# =============================================================================
+
+@mcp.tool()
+def get_file_contents(repo: str, path: str, ref: str = "main") -> str:
+    """
+    Get the contents of a file from a GitHub repository.
+
+    Args:
+        repo: Repository in 'owner/repo' format (e.g., 'prateekaryann/github-mcp')
+        path: Path to the file in the repo (e.g., 'src/main.py')
+        ref: Branch, tag, or commit SHA (default: 'main')
+
+    Returns:
+        File contents or error
+    """
+    result = run_gh(["api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".content"])
+
+    if result["success"]:
+        try:
+            decoded = base64.b64decode(result["output"]).decode("utf-8")
+            return f"📄 {path} (from {repo}@{ref}):\n\n{decoded}"
+        except Exception:
+            return result["output"]
+    else:
+        return f"❌ Failed to get file contents: {result['error']}"
+
+
+@mcp.tool()
+def create_or_update_file(
+    repo: str,
+    path: str,
+    content: str,
+    message: str,
+    branch: str = "main",
+) -> str:
+    """
+    Create or update a file in a GitHub repository via the API.
+
+    Args:
+        repo: Repository in 'owner/repo' format (e.g., 'prateekaryann/github-mcp')
+        path: Path to the file in the repo (e.g., 'docs/README.md')
+        content: The file content to write
+        message: Commit message for the change
+        branch: Branch to commit to (default: 'main')
+
+    Returns:
+        Success message with commit info or error
+    """
+    encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+
+    # Try to get existing file SHA (needed for updates)
+    sha_result = run_gh(["api", f"repos/{repo}/contents/{path}?ref={branch}", "--jq", ".sha"])
+    sha = sha_result["output"] if sha_result["success"] else None
+
+    # Build the API request
+    args = [
+        "api", "-X", "PUT",
+        f"repos/{repo}/contents/{path}",
+        "-f", f"message={message}",
+        "-f", f"content={encoded_content}",
+        "-f", f"branch={branch}",
+    ]
+
+    if sha:
+        args.extend(["-f", f"sha={sha}"])
+
+    result = run_gh(args)
+
+    if result["success"]:
+        action = "Updated" if sha else "Created"
+        return f"✅ {action} {path} in {repo} ({branch})\n\nCommit message: {message}"
+    else:
+        return f"❌ Failed to create/update file: {result['error']}"
+
+
+# =============================================================================
+# PR MERGE, REVIEW & DIFF
+# =============================================================================
+
+@mcp.tool()
+def merge_pr(
+    repo: str,
+    pr_number: int,
+    method: str = "merge",
+    delete_branch: bool = True,
+) -> str:
+    """
+    Merge a pull request.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        pr_number: Pull request number
+        method: Merge method - 'merge', 'squash', or 'rebase' (default: 'merge')
+        delete_branch: Whether to delete the branch after merging (default: True)
+
+    Returns:
+        Success message or error
+    """
+    args = ["pr", "merge", str(pr_number), "--repo", repo, f"--{method}"]
+
+    if delete_branch:
+        args.append("--delete-branch")
+
+    result = run_gh(args)
+
+    if result["success"]:
+        return f"✅ PR #{pr_number} merged ({method})!\n\n{result['output']}"
+    else:
+        return f"❌ Failed to merge PR: {result['error']}"
+
+
+@mcp.tool()
+def review_pr(
+    repo: str,
+    pr_number: int,
+    action: str = "approve",
+    body: str = "",
+) -> str:
+    """
+    Review a pull request.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        pr_number: Pull request number
+        action: Review action - 'approve', 'comment', or 'request-changes' (default: 'approve')
+        body: Review comment body (required for 'comment' and 'request-changes')
+
+    Returns:
+        Success message or error
+    """
+    args = ["pr", "review", str(pr_number), "--repo", repo, f"--{action}"]
+
+    if body:
+        args.extend(["--body", body])
+
+    result = run_gh(args)
+
+    if result["success"]:
+        return f"✅ PR #{pr_number} reviewed ({action})!\n\n{result['output']}"
+    else:
+        return f"❌ Failed to review PR: {result['error']}"
+
+
+@mcp.tool()
+def pr_diff(
+    repo: str,
+    pr_number: int,
+) -> str:
+    """
+    View the diff of a pull request.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        pr_number: Pull request number
+
+    Returns:
+        PR diff output or error
+    """
+    result = run_gh(["pr", "diff", str(pr_number), "--repo", repo])
+
+    if result["success"]:
+        return f"📋 Diff for PR #{pr_number}:\n\n{result['output']}"
+    else:
+        return f"❌ Failed to get PR diff: {result['error']}"
 
 
 # =============================================================================
@@ -633,6 +1107,90 @@ def create_gist(
             return f"❌ Failed to create gist: {result['error']}"
     finally:
         os.unlink(temp_path)
+
+
+# =============================================================================
+# WORKFLOWS (GitHub Actions)
+# =============================================================================
+
+@mcp.tool()
+def list_workflows(repo: str) -> str:
+    """
+    List workflows in a GitHub repository.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+
+    Returns:
+        List of workflows in the repository
+    """
+    result = run_gh(["workflow", "list", "--repo", repo])
+
+    if result["success"]:
+        return f"⚙️ Workflows for {repo}:\n\n{result['output']}"
+    else:
+        return f"❌ Failed to list workflows: {result['error']}"
+
+
+@mcp.tool()
+def run_workflow(repo: str, workflow: str, ref: str = "main") -> str:
+    """
+    Trigger a GitHub Actions workflow run.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        workflow: Workflow filename or ID (e.g., 'build.yml')
+        ref: Branch or tag to run the workflow on
+
+    Returns:
+        Confirmation of workflow trigger
+    """
+    result = run_gh(["workflow", "run", workflow, "--repo", repo, "--ref", ref])
+
+    if result["success"]:
+        return f"✅ Workflow '{workflow}' triggered on {ref} in {repo}\n\n{result['output']}"
+    else:
+        return f"❌ Failed to trigger workflow: {result['error']}"
+
+
+@mcp.tool()
+def list_workflow_runs(repo: str, limit: int = 10) -> str:
+    """
+    List recent GitHub Actions workflow runs.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        limit: Maximum number of runs to show
+
+    Returns:
+        List of recent workflow runs
+    """
+    result = run_gh(["run", "list", "--repo", repo, "--limit", str(limit)])
+
+    if result["success"]:
+        return f"🔄 Recent workflow runs for {repo}:\n\n{result['output']}"
+    else:
+        return f"❌ Failed to list workflow runs: {result['error']}"
+
+
+@mcp.tool()
+def view_workflow_run(repo: str, run_id: str) -> str:
+    """
+    View details of a specific GitHub Actions workflow run.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        run_id: The ID of the workflow run
+
+    Returns:
+        Details of the workflow run
+    """
+    result = run_gh(["run", "view", run_id, "--repo", repo])
+
+    if result["success"]:
+        return f"📋 Workflow run {run_id}:\n\n{result['output']}"
+    else:
+        return f"❌ Failed to view workflow run: {result['error']}"
 
 
 # =============================================================================
@@ -708,6 +1266,29 @@ def create_release(
         return f"✅ Release created!\n\n{result['output']}"
     else:
         return f"❌ Failed to create release: {result['error']}"
+
+
+@mcp.tool()
+def list_releases(repo: str, limit: int = 10) -> str:
+    """
+    List releases for a GitHub repository.
+
+    Args:
+        repo: Repository in 'owner/repo' format
+        limit: Maximum number of releases to list (default: 10)
+
+    Returns:
+        List of releases or error
+    """
+    result = run_gh(["release", "list", "--repo", repo, "--limit", str(limit)])
+
+    if result["success"]:
+        output = result["output"].strip()
+        if not output:
+            return f"ℹ️ No releases found for {repo}"
+        return f"📋 Releases for {repo}:\n\n{output}"
+    else:
+        return f"❌ Failed to list releases: {result['error']}"
 
 
 # =============================================================================
