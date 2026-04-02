@@ -29,13 +29,40 @@ import argparse
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-# Initialize MCP server
-# Disable DNS rebinding protection since we use Bearer token auth for remote access
+# Initialize MCP server with OAuth for remote, plain for local
 _transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
 _security = None
+_oauth_provider = None
+
 if _transport == "sse":
     _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-mcp = FastMCP("github-cli", transport_security=_security)
+
+    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+    from oauth_provider import InMemoryOAuthProvider
+
+    _server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
+    _oauth_provider = InMemoryOAuthProvider()
+
+    _auth_settings = AuthSettings(
+        issuer_url=_server_url,
+        resource_server_url=_server_url,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=["read", "write"],
+            default_scopes=["read", "write"],
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+        required_scopes=["read"],
+    )
+
+    mcp = FastMCP(
+        "github-cli",
+        transport_security=_security,
+        auth=_auth_settings,
+        auth_server_provider=_oauth_provider,
+    )
+else:
+    mcp = FastMCP("github-cli")
 
 # Default working directory for git operations
 WORK_DIR = Path(os.environ.get("WORK_DIR", str(Path.home() / "projects")))
@@ -1668,45 +1695,79 @@ if __name__ == "__main__":
 
     if transport == "sse":
         port = int(os.environ.get("MCP_PORT", "8080"))
-        api_key = os.environ.get("MCP_API_KEY", "")
-
-        if not api_key:
-            print("⚠️  MCP_API_KEY not set! Generate one with:")
-            print('   python -c "import secrets; print(secrets.token_urlsafe(32))"')
-            sys.exit(1)
 
         logger.info(f"Starting SSE transport on port {port} (read_only={READ_ONLY})")
 
-        from starlette.applications import Starlette
-        from starlette.middleware import Middleware
-        from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.requests import Request
-        from starlette.responses import JSONResponse
-        from starlette.routing import Mount
-        import hmac
+        from starlette.responses import HTMLResponse, RedirectResponse
+        from starlette.routing import Route
         import uvicorn
+        from oauth_provider import AUTH_PASSWORD
 
-        class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-            """Reject requests without a valid Bearer token."""
-            async def dispatch(self, request: Request, call_next):
-                if request.url.path in ("/health", "/healthz"):
-                    return await call_next(request)
-                auth = request.headers.get("Authorization", "")
-                expected = f"Bearer {api_key}"
-                # Timing-safe comparison to prevent key extraction via timing attacks
-                if not hmac.compare_digest(auth.encode(), expected.encode()):
-                    logger.warning(f"AUTH_REJECTED: {request.client.host} — invalid key")
-                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
-                return await call_next(request)
+        # Consent page — shown when Claude.ai tries to authorize
+        async def consent_page(request: Request):
+            request_id = request.query_params.get("request_id", "")
+            error = request.query_params.get("error", "")
 
-        # Use Streamable HTTP transport (supported by Claude.ai)
-        streamable_app = mcp.streamable_http_app()
-        streamable_app.add_middleware(APIKeyAuthMiddleware)
+            if request.method == "POST":
+                form = await request.form()
+                password = form.get("password", "")
+                req_id = form.get("request_id", "")
+
+                if password == AUTH_PASSWORD:
+                    redirect_url = _oauth_provider.complete_authorization(req_id)
+                    if redirect_url:
+                        return RedirectResponse(redirect_url, status_code=302)
+                    return HTMLResponse("<h2>Invalid or expired request</h2>", status_code=400)
+                else:
+                    return RedirectResponse(f"/consent?request_id={req_id}&error=wrong_password", status_code=302)
+
+            pending = _oauth_provider.get_pending_auth(request_id)
+            if not pending:
+                return HTMLResponse("<h2>Invalid or expired authorization request</h2>", status_code=400)
+
+            error_html = '<p style="color:red">Wrong password. Try again.</p>' if error else ""
+
+            return HTMLResponse(f"""
+            <!DOCTYPE html>
+            <html><head><title>GitHub MCP - Authorize</title>
+            <style>
+                body {{ font-family: -apple-system, sans-serif; max-width: 400px; margin: 80px auto; padding: 20px; }}
+                h2 {{ color: #333; }}
+                .info {{ background: #f0f0f0; padding: 12px; border-radius: 8px; margin: 16px 0; font-size: 14px; }}
+                input[type=password] {{ width: 100%; padding: 10px; margin: 8px 0; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }}
+                button {{ width: 100%; padding: 12px; background: #2563eb; color: white; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; }}
+                button:hover {{ background: #1d4ed8; }}
+            </style></head>
+            <body>
+                <h2>Authorize GitHub MCP</h2>
+                <div class="info">
+                    <strong>Client:</strong> {pending['client_id'][:16]}...<br>
+                    <strong>Scopes:</strong> {', '.join(pending.get('scopes', ['read', 'write']))}
+                </div>
+                {error_html}
+                <form method="POST" action="/consent">
+                    <input type="hidden" name="request_id" value="{request_id}">
+                    <label>Enter password to approve:</label>
+                    <input type="password" name="password" autofocus placeholder="Password">
+                    <br><br>
+                    <button type="submit">Approve Connection</button>
+                </form>
+            </body></html>
+            """)
+
+        # Build the SSE app with OAuth (FastMCP handles auth routes automatically)
+        sse_app = mcp.sse_app()
+
+        # Add consent route to the SSE app
+        sse_app.routes.insert(0, Route("/consent", consent_page, methods=["GET", "POST"]))
 
         print(f"MCP Server running on http://0.0.0.0:{port}")
-        print(f"  Endpoint: http://localhost:{port}/mcp")
+        print(f"  SSE endpoint: http://localhost:{port}/sse")
+        print(f"  OAuth consent: http://localhost:{port}/consent")
         print(f"  Read-only: {READ_ONLY}")
-        uvicorn.run(streamable_app, host="0.0.0.0", port=port, log_level="info")
+        print(f"  Auth password: {AUTH_PASSWORD}")
+        uvicorn.run(sse_app, host="0.0.0.0", port=port, log_level="info")
     else:
         logger.info(f"Starting stdio transport (read_only={READ_ONLY})")
         mcp.run()
