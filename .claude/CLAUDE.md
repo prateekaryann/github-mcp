@@ -2,36 +2,36 @@
 
 ## Project Overview
 
-This is a **Model Context Protocol (MCP)** server that wraps the GitHub CLI (`gh`) to provide GitHub operations directly from Claude Desktop/Code. It enables Claude to create repos, push code, manage issues, and more.
+This is a **Model Context Protocol (MCP)** server that wraps the GitHub CLI (`gh`) to provide 39 GitHub operations directly from Claude Desktop/Code/Web. It supports local (stdio) and remote (SSE + OAuth 2.0) transport modes with comprehensive security hardening.
 
 **Owner**: Prateek Aryan (@prateekaryann)  
-**Stack**: Python 3.10+, FastMCP, GitHub CLI (gh)  
-**Purpose**: Seamless GitHub integration for Claude - push code, manage repos without leaving the chat
+**Stack**: Python 3.10+, MCP SDK (`mcp[cli]`), GitHub CLI (`gh`), uvicorn, starlette  
+**Repo**: github.com/prateekaryann/github-mcp  
+**Purpose**: Seamless GitHub integration for Claude — push code, manage repos, PRs, issues, workflows without leaving the chat
 
 ---
 
 ## Quick Start (Local Development)
 
 ```bash
-# 1. Ensure GitHub CLI is installed
-gh --version  # Should show version
+# 1. Ensure GitHub CLI is installed and authenticated
+gh --version && gh auth status
 
-# 2. Authenticate if not already
-gh auth login
-gh auth status  # Verify: ✓ Logged in to github.com as prateekaryann
-
-# 3. Navigate to project
+# 2. Navigate to project
 cd ~/projects/github-mcp
 
-# 4. Create/activate virtual environment
-python3 -m venv venv
+# 3. Create/activate virtual environment
+python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# 5. Install dependencies
+# 4. Install dependencies
 pip install -r requirements.txt
 
-# 6. Run the server
+# 5. Run the server (stdio mode for Claude Desktop/Code)
 python server.py
+
+# 6. Run in remote mode (SSE + OAuth for Claude.ai)
+MCP_TRANSPORT=sse MCP_PORT=9000 MCP_SERVER_URL=https://your-tunnel.ngrok-free.dev python server.py
 ```
 
 ---
@@ -40,15 +40,20 @@ python server.py
 
 ```
 github-mcp/
-├── server.py         # Main MCP server - all tools in one file
-├── requirements.txt  # Just fastmcp>=2.0.0
-├── README.md
-├── LICENSE
+├── server.py              # Main MCP server — 39 tools, security, transport (1773 lines)
+├── oauth_provider.py      # In-memory OAuth 2.0 provider for Claude.ai (214 lines)
+├── requirements.txt       # mcp[cli], uvicorn>=0.27.0, starlette>=0.36.0
+├── .env.example           # Configuration template (all env vars documented)
+├── tunnel.sh              # Bash: start server + ngrok tunnel
+├── tunnel.ps1             # PowerShell: start server + ngrok tunnel
+├── README.md              # Public documentation
+├── LICENSE                # MIT
+├── .gitignore
 └── .claude/
-    └── CLAUDE.md     # This file
+    └── CLAUDE.md          # This file
 ```
 
-**Design Philosophy**: Single-file server wrapping `gh` CLI commands via subprocess.
+**Design Philosophy**: Single-file server (`server.py`) wrapping `gh` CLI commands via subprocess. OAuth provider is separate (`oauth_provider.py`). All tools in one file for simplicity.
 
 ---
 
@@ -64,14 +69,27 @@ def run_git(args: list[str], cwd: Optional[str] = None) -> dict:
     """Run git command, return {success, output, error}"""
 ```
 
-### MCP Tools
+### Security Functions
+
+```python
+def validate_path(repo_path: str) -> str:       # Sandbox to WORK_DIR
+def validate_repo_name(repo: str) -> str:        # Regex: owner/repo format
+def validate_branch_name(branch: str) -> str:    # Regex: safe branch chars
+def validate_username(username: str) -> str:      # Regex: safe username chars
+def validate_file_path(path: str) -> str:         # Block query injection (?&=#)
+def log_tool_call(tool_name, **kwargs):           # Audit logging
+def require_write_access(tool_name):              # Read-only mode guard
+```
+
+### MCP Tools (39 total)
 
 | Category | Tool | Description |
 |----------|------|-------------|
 | **Auth** | `auth_status` | Check gh auth status |
 | | `whoami` | Get authenticated username |
+| | `switch_account` | Switch active gh account |
 | **Repos** | `create_repo` | Create new GitHub repo |
-| | `list_repos` | List user/org repos |
+| | `list_repos` | List repos (JSON formatted) |
 | | `repo_view` | View repo details |
 | | `clone_repo` | Clone repo locally |
 | | `delete_repo` | Delete repo (with confirmation) |
@@ -79,13 +97,33 @@ def run_git(args: list[str], cwd: Optional[str] = None) -> dict:
 | | `git_add_commit_push` | Add, commit, push in one command |
 | | `git_init_and_push` | Init local dir + create GitHub repo + push |
 | | `git_pull` | Pull latest changes |
+| **Branches** | `create_branch` | Create new branch |
+| | `list_branches` | List local branches |
+| | `switch_branch` | Checkout a branch |
+| | `delete_branch` | Delete local branch |
+| **Forks** | `fork_repo` | Fork a repository |
+| | `sync_fork` | Sync fork with upstream |
 | **Issues** | `create_issue` | Create new issue |
-| | `list_issues` | List repo issues |
+| | `list_issues` | List repo issues (JSON formatted) |
+| | `comment_on_issue` | Comment on an issue |
 | **PRs** | `create_pr` | Create pull request |
-| | `list_prs` | List pull requests |
-| **Other** | `create_gist` | Create GitHub gist |
-| | `search_repos` | Search GitHub repos |
-| | `create_release` | Create GitHub release |
+| | `list_prs` | List pull requests (JSON formatted) |
+| | `comment_on_pr` | Comment on a PR |
+| | `merge_pr` | Merge a PR (merge/squash/rebase) |
+| | `review_pr` | Review a PR (approve/comment/request-changes) |
+| | `pr_diff` | View PR diff |
+| **Collaborators** | `list_collaborators` | List repo collaborators |
+| | `add_collaborator` | Add collaborator (pull/push/admin) |
+| **File Ops** | `get_file_contents` | Get file from GitHub repo via API |
+| | `create_or_update_file` | Create/update file via API |
+| **Gists** | `create_gist` | Create GitHub gist |
+| **Workflows** | `list_workflows` | List GitHub Actions workflows |
+| | `run_workflow` | Trigger a workflow run |
+| | `list_workflow_runs` | List recent workflow runs |
+| | `view_workflow_run` | View specific run details |
+| **Search** | `search_repos` | Search GitHub repositories |
+| **Releases** | `create_release` | Create GitHub release |
+| | `list_releases` | List releases |
 
 ---
 
@@ -93,32 +131,33 @@ def run_git(args: list[str], cwd: Optional[str] = None) -> dict:
 
 ### Add a New Tool
 
-1. Add function with `@mcp.tool()` decorator:
+1. Add function with `@mcp.tool()` decorator in the appropriate section of `server.py`:
 ```python
 @mcp.tool()
 def my_new_tool(param1: str, param2: int = 10) -> str:
-    """
-    Tool description shown to Claude.
+    """Tool description shown to Claude."""
+    log_tool_call("my_new_tool", param1=param1, param2=param2)
+    try:
+        require_write_access("my_new_tool")  # if it's a write operation
+        param1 = validate_repo_name(param1)  # validate inputs as needed
+    except (PermissionError, ValueError) as e:
+        return str(e)
     
-    Args:
-        param1: Description of param1
-        param2: Description with default
-        
-    Returns:
-        What the tool returns
-    """
     result = run_gh(["some", "command", param1])
-    
     if result["success"]:
-        return f"✅ Success\n\n{result['output']}"
+        return f"Success\n\n{result['output']}"
     else:
-        return f"❌ Failed: {result['error']}"
+        return f"Failed: {result['error']}"
 ```
 
-2. Test it manually:
-```bash
-gh some command test_value  # Verify the underlying command works
-```
+2. Security checklist for new tools:
+   - Add `log_tool_call()` at the start
+   - Add `require_write_access()` if tool modifies state
+   - Add `validate_path()` for `repo_path` params
+   - Add `validate_repo_name()` for `repo` params
+   - Add `validate_branch_name()` for branch params
+   - Add `validate_username()` for username params
+   - Add `validate_file_path()` for file path params in API URLs
 
 ### Add GitHub API Endpoint
 
@@ -127,55 +166,51 @@ For operations not supported by `gh` CLI directly, use `gh api`:
 @mcp.tool()
 def get_repo_languages(repo: str) -> str:
     """Get languages used in a repository."""
+    log_tool_call("get_repo_languages", repo=repo)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["api", f"repos/{repo}/languages"])
-    # result["output"] will be JSON
     return result["output"] if result["success"] else result["error"]
-```
-
-### Handle User Confirmation for Dangerous Operations
-
-```python
-@mcp.tool()
-def dangerous_operation(target: str, confirm: bool = False) -> str:
-    """Do something dangerous."""
-    if not confirm:
-        return "⚠️ Set confirm=True to proceed. This cannot be undone!"
-    
-    # Proceed with operation
 ```
 
 ---
 
-## Prerequisites
+## Transport Modes
 
-### GitHub CLI Installation
-
+### stdio (default) — Local Use
 ```bash
-# macOS
-brew install gh
-
-# Ubuntu/Debian
-sudo apt install gh
-
-# Windows
-winget install GitHub.cli
-
-# Verify
-gh --version
+python server.py
 ```
+Used by Claude Desktop and Claude Code. No network exposure, no auth needed.
 
-### Authentication
-
+### SSE — Remote Use (Claude.ai)
 ```bash
-# Interactive login
-gh auth login
-
-# Check status
-gh auth status
-
-# Re-authenticate if needed
-gh auth refresh
+MCP_TRANSPORT=sse MCP_PORT=9000 MCP_SERVER_URL=https://your-tunnel.ngrok-free.dev python server.py
 ```
+Enables OAuth 2.0 automatically:
+- `/.well-known/oauth-authorization-server` — OAuth metadata
+- `/.well-known/oauth-protected-resource` — Protected resource metadata
+- `/register` — Dynamic client registration (RFC 7591)
+- `/authorize` — Authorization endpoint (redirects to `/consent`)
+- `/consent` — Password-based consent page
+- `/token` — Token exchange endpoint
+- `/revoke` — Token revocation
+
+---
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `WORK_DIR` | Base directory for git operations | `~/projects` |
+| `READ_ONLY` | Block all write tools when `true` | `false` |
+| `LOG_FILE` | Audit log file path | `mcp_audit.log` |
+| `MCP_TRANSPORT` | `stdio` or `sse` | `stdio` |
+| `MCP_PORT` | Port for SSE transport | `8080` |
+| `MCP_SERVER_URL` | Public URL for OAuth metadata (required for SSE) | `http://localhost:8080` |
+| `MCP_AUTH_PASSWORD` | Password for OAuth consent page | `approve` |
 
 ---
 
@@ -200,23 +235,14 @@ gh auth refresh
 
 ---
 
-## Environment
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `WORK_DIR` | Base directory for git operations | `~/projects` |
-
-The server uses your existing `gh` authentication - no additional credentials needed.
-
----
-
 ## Coding Conventions
 
-- **Single file**: Keep all tools in `server.py` for simplicity
+- **Single file for tools**: Keep all tools in `server.py`
+- **Separate file for OAuth**: OAuth provider logic in `oauth_provider.py`
 - **Type hints**: All functions must have type hints
 - **Docstrings**: Every tool needs a docstring (shown to Claude)
+- **Security first**: Every tool must have `log_tool_call`, input validation, and write guards where applicable
 - **Error handling**: Always return user-friendly messages, never raw exceptions
-- **Emojis**: Use ✅ ❌ ⚠️ ℹ️ 📁 🔀 📋 for visual feedback
 
 ---
 
@@ -227,21 +253,30 @@ The server uses your existing `gh` authentication - no additional credentials ne
 gh auth status
 gh repo list --limit 3
 
-# Test server imports
-python -c "from server import mcp; print('OK')"
+# Test server imports and tool count
+python -c "from server import mcp; print(len(mcp._tool_manager._tools), 'tools loaded')"
 
-# Run server in stdio mode (Claude will connect)
+# Test security - path sandboxing
+python -c "from server import validate_path; validate_path('C:/Windows')"  # Should raise ValueError
+
+# Run server in stdio mode
 python server.py
+
+# Run server in SSE mode with OAuth
+MCP_TRANSPORT=sse MCP_PORT=9000 MCP_SERVER_URL=http://localhost:9000 python server.py
 ```
 
 ---
 
 ## Security Notes
 
-- Runs `gh` and `git` commands via subprocess on your machine
-- Uses your existing GitHub CLI authentication
-- `delete_repo` requires explicit `confirm=True` parameter
-- No credentials stored - relies entirely on `gh auth`
+- **Path sandboxing**: All `repo_path` params validated against `WORK_DIR` (prevents directory traversal)
+- **Input validation**: Regex checks on repo names, branch names, usernames, file paths
+- **Read-only mode**: `READ_ONLY=true` blocks all write operations (19+ tools)
+- **Audit logging**: Every tool call logged with truncated params to `mcp_audit.log`
+- **OAuth 2.0**: SSE transport uses full OAuth flow (dynamic registration, PKCE, consent page)
+- **No credentials stored**: Relies entirely on `gh auth` — no tokens in config
+- **Subprocess safety**: All commands use list args (no `shell=True`)
 
 ---
 
@@ -251,12 +286,14 @@ python server.py
 - Commands timeout after 60-120 seconds
 - Some operations require push access to repos
 - Rate limited by GitHub API (5000 requests/hour authenticated)
+- OAuth tokens are in-memory (lost on server restart — Claude.ai re-authenticates automatically)
+- ngrok free tier URLs change on restart (use Cloudflare Tunnel or paid ngrok for permanent URLs)
 
 ---
 
 ## Memory Context
 
-**Created by**: Prateek Aryan (Senior Software Engineer)  
+**Created by**: Prateek Aryan (Senior Software Engineer / Tech Lead)  
 **Primary use case**: Push MCP servers and projects to GitHub from Claude  
-**Workflow**: Build in Claude → Push via this MCP → Iterate  
+**Workflow**: Build in Claude -> Push via this MCP -> Iterate  
 **GitHub username**: prateekaryann
