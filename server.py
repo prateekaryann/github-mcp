@@ -1699,14 +1699,14 @@ if __name__ == "__main__":
                     return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return await call_next(request)
 
-        # Wrap the SSE app with auth middleware
-        sse_app = mcp.sse_app()
-        sse_app.add_middleware(APIKeyAuthMiddleware)
+        # Use Streamable HTTP transport (supported by Claude.ai)
+        streamable_app = mcp.streamable_http_app()
+        streamable_app.add_middleware(APIKeyAuthMiddleware)
 
-        print(f"MCP Server (SSE) running on http://0.0.0.0:{port}")
-        print(f"  Endpoint: http://localhost:{port}/sse")
+        print(f"MCP Server running on http://0.0.0.0:{port}")
+        print(f"  Endpoint: http://localhost:{port}/mcp")
         print(f"  Read-only: {READ_ONLY}")
-        uvicorn.run(sse_app, host="0.0.0.0", port=port, log_level="info")
+        uvicorn.run(streamable_app, host="0.0.0.0", port=port, log_level="info")
     else:
         logger.info(f"Starting stdio transport (read_only={READ_ONLY})")
         mcp.run()
