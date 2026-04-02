@@ -27,9 +27,15 @@ import sys
 import argparse
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # Initialize MCP server
-mcp = FastMCP("github-cli")
+# Disable DNS rebinding protection since we use Bearer token auth for remote access
+_transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+_security = None
+if _transport == "sse":
+    _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+mcp = FastMCP("github-cli", transport_security=_security)
 
 # Default working directory for git operations
 WORK_DIR = Path(os.environ.get("WORK_DIR", str(Path.home() / "projects")))
@@ -1676,6 +1682,7 @@ if __name__ == "__main__":
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.requests import Request
         from starlette.responses import JSONResponse
+        from starlette.routing import Mount
         import hmac
         import uvicorn
 
@@ -1692,14 +1699,14 @@ if __name__ == "__main__":
                     return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return await call_next(request)
 
-        # Get the SSE app from FastMCP and wrap with auth
+        # Wrap the SSE app with auth middleware
         sse_app = mcp.sse_app()
         sse_app.add_middleware(APIKeyAuthMiddleware)
 
-        print(f"🚀 MCP Server (SSE) running on http://127.0.0.1:{port}")
-        print(f"   Endpoint: http://localhost:{port}/sse")
-        print(f"   Read-only: {READ_ONLY}")
-        uvicorn.run(sse_app, host="127.0.0.1", port=port, log_level="info")
+        print(f"MCP Server (SSE) running on http://0.0.0.0:{port}")
+        print(f"  Endpoint: http://localhost:{port}/sse")
+        print(f"  Read-only: {READ_ONLY}")
+        uvicorn.run(sse_app, host="0.0.0.0", port=port, log_level="info")
     else:
         logger.info(f"Starting stdio transport (read_only={READ_ONLY})")
         mcp.run()
