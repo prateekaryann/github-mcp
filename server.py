@@ -321,6 +321,148 @@ def create_repo(
 
 
 @mcp.tool()
+def create_repo_with_files(
+    repo_name: str,
+    files: list[dict],
+    description: str = "",
+    public: bool = True,
+) -> str:
+    """
+    Create a new GitHub repo and populate it with files in a single operation.
+    Uses the GitHub REST API directly — works from Claude.ai without local filesystem.
+
+    Args:
+        repo_name: Repository name (e.g., 'my-project')
+        files: List of files, each a dict with 'path' and 'content' keys.
+               Example: [{"path": "README.md", "content": "# My Project"}, {"path": "src/main.py", "content": "print('hello')"}]
+        description: Repository description
+        public: Whether the repo should be public (default: True)
+
+    Returns:
+        Repo URL on success, or error message
+    """
+    log_tool_call("create_repo_with_files", repo_name=repo_name, files=f"[{len(files)} files]", description=description, public=public)
+    try:
+        require_write_access("create_repo_with_files")
+        repo_name = validate_repo_name(repo_name)
+    except (PermissionError, ValueError) as e:
+        return str(e)
+
+    if not files:
+        return "❌ No files provided. Pass at least one file with 'path' and 'content'."
+
+    for f in files:
+        if not isinstance(f, dict) or "path" not in f or "content" not in f:
+            return "❌ Each file must be a dict with 'path' and 'content' keys."
+
+    # Step 1: Get authenticated username
+    user_result = run_gh(["api", "user", "--jq", ".login"])
+    if not user_result["success"]:
+        return f"❌ Failed to get username: {user_result['error']}"
+    owner = user_result["output"].strip()
+
+    # Step 2: Create the repository with auto_init to get an initial commit
+    create_args = [
+        "api", "user/repos", "-X", "POST",
+        "-f", f"name={repo_name}",
+        "-f", f"description={description}",
+        "-F", f"private={str(not public).lower()}",
+        "-F", "auto_init=true",
+    ]
+    create_result = run_gh(create_args)
+    if not create_result["success"]:
+        if "already exists" in (create_result["error"] or ""):
+            return f"❌ Repository '{repo_name}' already exists."
+        return f"❌ Failed to create repo: {create_result['error']}"
+
+    repo_full = f"{owner}/{repo_name}"
+
+    # Brief pause for GitHub to initialize the repo
+    import time as _time
+    _time.sleep(2)
+
+    # Step 3: Get the current commit SHA on main (from auto_init)
+    ref_result = run_gh([
+        "api", f"repos/{repo_full}/git/ref/heads/main",
+        "--jq", ".object.sha",
+    ])
+    if not ref_result["success"]:
+        return f"❌ Repo created but failed to get initial commit: {ref_result['error']}\n\n🔗 https://github.com/{repo_full}"
+    parent_sha = ref_result["output"].strip()
+
+    # Step 4: Create blobs for each file
+    tree_entries = []
+    for f in files:
+        encoded = base64.b64encode(f["content"].encode("utf-8")).decode("utf-8")
+        blob_result = run_gh([
+            "api", f"repos/{repo_full}/git/blobs", "-X", "POST",
+            "-f", f"content={encoded}",
+            "-f", "encoding=base64",
+            "--jq", ".sha",
+        ])
+        if not blob_result["success"]:
+            return f"❌ Failed to create blob for '{f['path']}': {blob_result['error']}"
+        tree_entries.append({
+            "path": f["path"],
+            "mode": "100644",
+            "type": "blob",
+            "sha": blob_result["output"].strip(),
+        })
+
+    # Step 5: Create a tree (with base_tree from parent to keep README from auto_init)
+    import tempfile
+    tree_json = json.dumps({"base_tree": parent_sha, "tree": tree_entries})
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+        tf.write(tree_json)
+        tf_path = tf.name
+    try:
+        tree_result = run_gh([
+            "api", f"repos/{repo_full}/git/trees", "-X", "POST",
+            "--input", tf_path,
+            "--jq", ".sha",
+        ])
+    finally:
+        os.unlink(tf_path)
+
+    if not tree_result["success"]:
+        return f"❌ Failed to create tree: {tree_result['error']}"
+    tree_sha = tree_result["output"].strip()
+
+    # Step 6: Create a commit with the parent
+    commit_json = json.dumps({
+        "message": "Initial commit — files added via MCP",
+        "tree": tree_sha,
+        "parents": [parent_sha],
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+        tf.write(commit_json)
+        tf_path = tf.name
+    try:
+        commit_result = run_gh([
+            "api", f"repos/{repo_full}/git/commits", "-X", "POST",
+            "--input", tf_path,
+            "--jq", ".sha",
+        ])
+    finally:
+        os.unlink(tf_path)
+
+    if not commit_result["success"]:
+        return f"❌ Failed to create commit: {commit_result['error']}"
+    commit_sha = commit_result["output"].strip()
+
+    # Step 7: Update refs/heads/main to point to new commit
+    update_ref = run_gh([
+        "api", f"repos/{repo_full}/git/refs/heads/main", "-X", "PATCH",
+        "-f", f"sha={commit_sha}",
+    ])
+    if not update_ref["success"]:
+        return f"❌ Failed to update ref: {update_ref['error']}"
+
+    file_list = "\n".join(f"  - {f['path']}" for f in files)
+    return f"✅ Repository created with {len(files)} files!\n\nFiles:\n{file_list}\n\n🔗 https://github.com/{repo_full}"
+
+
+@mcp.tool()
 def list_repos(
     owner: Optional[str] = None,
     limit: int = 10,
