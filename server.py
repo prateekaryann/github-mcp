@@ -21,6 +21,10 @@ import os
 import shutil
 from typing import Optional
 from pathlib import Path
+import logging
+import re
+import sys
+import argparse
 
 from mcp.server.fastmcp import FastMCP
 
@@ -29,6 +33,82 @@ mcp = FastMCP("github-cli")
 
 # Default working directory for git operations
 WORK_DIR = Path(os.environ.get("WORK_DIR", str(Path.home() / "projects")))
+
+# =============================================================================
+# SECURITY & CONFIGURATION
+# =============================================================================
+
+# Read-only mode: only expose safe tools (list/view/search)
+READ_ONLY = os.environ.get("READ_ONLY", "false").lower() == "true"
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(os.environ.get("LOG_FILE", "mcp_audit.log")),
+    ],
+)
+logger = logging.getLogger("github-mcp")
+
+
+def validate_path(repo_path: str) -> str:
+    """Validate and sandbox repo_path to WORK_DIR. Raises ValueError if outside."""
+    resolved = Path(repo_path).expanduser().resolve()
+    work_resolved = WORK_DIR.resolve()
+    # Use os.sep suffix to prevent prefix-matching bypass
+    # e.g. WORK_DIR=/home/user/pro must NOT allow /home/user/projects-evil
+    if resolved != work_resolved and not str(resolved).startswith(str(work_resolved) + os.sep):
+        raise ValueError(
+            f"⛔ Path '{repo_path}' is outside allowed directory '{WORK_DIR}'. "
+            f"Set WORK_DIR env var to change the allowed base directory."
+        )
+    return str(resolved)
+
+
+def validate_repo_name(repo: str) -> str:
+    """Validate repo format is 'owner/repo' or just 'repo-name'."""
+    if not re.match(r'^[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)?$', repo):
+        raise ValueError(f"⛔ Invalid repository name: '{repo}'")
+    return repo
+
+
+def validate_username(username: str) -> str:
+    """Validate GitHub username contains only safe characters."""
+    if not re.match(r'^[a-zA-Z0-9._-]+$', username):
+        raise ValueError(f"⛔ Invalid username: '{username}'")
+    return username
+
+
+def validate_file_path(path: str) -> str:
+    """Validate file path for GitHub API operations (no query injection)."""
+    if re.search(r'[?&=#]', path):
+        raise ValueError(f"⛔ Invalid file path: '{path}'")
+    return path
+
+
+def validate_branch_name(branch: str) -> str:
+    """Validate branch name contains only safe characters."""
+    if not re.match(r'^[a-zA-Z0-9._/-]+$', branch):
+        raise ValueError(f"⛔ Invalid branch name: '{branch}'")
+    return branch
+
+
+def log_tool_call(tool_name: str, **kwargs):
+    """Log every tool invocation for audit trail."""
+    # Redact content fields that could be large
+    safe_kwargs = {k: (v[:100] + "..." if isinstance(v, str) and len(v) > 100 else v) for k, v in kwargs.items()}
+    logger.info(f"TOOL_CALL: {tool_name} | params={safe_kwargs}")
+
+
+def require_write_access(tool_name: str):
+    """Block write operations in read-only mode."""
+    if READ_ONLY:
+        raise PermissionError(
+            f"⛔ Tool '{tool_name}' is blocked in READ_ONLY mode. "
+            f"Set READ_ONLY=false to enable write operations."
+        )
 
 
 def run_gh(args: list[str], cwd: Optional[str] = None) -> dict:
@@ -110,6 +190,7 @@ def auth_status() -> str:
     Check GitHub CLI authentication status.
     Shows which account is logged in and what scopes are available.
     """
+    log_tool_call("auth_status")
     result = run_gh(["auth", "status"])
     
     if result["success"]:
@@ -121,6 +202,7 @@ def auth_status() -> str:
 @mcp.tool()
 def whoami() -> str:
     """Get the currently authenticated GitHub username."""
+    log_tool_call("whoami")
     result = run_gh(["api", "user", "--jq", ".login"])
     
     if result["success"]:
@@ -140,6 +222,12 @@ def switch_account(username: str) -> str:
     Returns:
         Confirmation of the switch with current auth status
     """
+    log_tool_call("switch_account", username=username)
+    try:
+        require_write_access("switch_account")
+        username = validate_username(username)
+    except (PermissionError, ValueError) as e:
+        return str(e)
     result = run_gh(["auth", "switch", "--user", username])
 
     if result["success"]:
@@ -172,6 +260,12 @@ def create_repo(
     Returns:
         Success message with repo URL or error
     """
+    log_tool_call("create_repo", name=name, description=description, public=public, clone=clone)
+    try:
+        require_write_access("create_repo")
+        name = validate_repo_name(name)
+    except (PermissionError, ValueError) as e:
+        return str(e)
     args = ["repo", "create", name]
     
     if description:
@@ -210,6 +304,7 @@ def list_repos(
     Returns:
         List of repositories
     """
+    log_tool_call("list_repos", owner=owner, limit=limit, visibility=visibility)
     args = ["repo", "list"]
 
     if owner:
@@ -252,6 +347,11 @@ def repo_view(repo: str) -> str:
     Returns:
         Repository details including description, stars, forks, etc.
     """
+    log_tool_call("repo_view", repo=repo)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["repo", "view", repo])
     
     if result["success"]:
@@ -272,6 +372,12 @@ def clone_repo(repo: str, directory: Optional[str] = None) -> str:
     Returns:
         Success message or error
     """
+    log_tool_call("clone_repo", repo=repo, directory=directory)
+    try:
+        require_write_access("clone_repo")
+        repo = validate_repo_name(repo)
+    except (PermissionError, ValueError) as e:
+        return str(e)
     args = ["repo", "clone", repo]
     
     if directory:
@@ -298,6 +404,15 @@ def delete_repo(repo: str, confirm: bool = False) -> str:
     Returns:
         Confirmation or error
     """
+    log_tool_call("delete_repo", repo=repo, confirm=confirm)
+    try:
+        require_write_access("delete_repo")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     if not confirm:
         return "⚠️ Safety check: Set confirm=True to actually delete the repository. This cannot be undone!"
     
@@ -324,6 +439,11 @@ def git_status(repo_path: str) -> str:
     Returns:
         Git status output
     """
+    log_tool_call("git_status", repo_path=repo_path)
+    try:
+        repo_path = validate_path(repo_path)
+    except ValueError as e:
+        return str(e)
     result = run_git(["status"], cwd=repo_path)
     
     if result["success"]:
@@ -351,8 +471,21 @@ def git_add_commit_push(
     Returns:
         Success message or error
     """
+    log_tool_call("git_add_commit_push", repo_path=repo_path, message=message, add_all=add_all, branch=branch)
+    try:
+        require_write_access("git_add_commit_push")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo_path = validate_path(repo_path)
+    except ValueError as e:
+        return str(e)
+    try:
+        branch = validate_branch_name(branch)
+    except ValueError as e:
+        return str(e)
     results = []
-    
+
     # Add
     if add_all:
         add_result = run_git(["add", "."], cwd=repo_path)
@@ -399,6 +532,15 @@ def git_init_and_push(
     Returns:
         Success message with repo URL or error
     """
+    log_tool_call("git_init_and_push", repo_path=repo_path, repo_name=repo_name, description=description, public=public, commit_message=commit_message)
+    try:
+        require_write_access("git_init_and_push")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo_path = validate_path(repo_path)
+    except ValueError as e:
+        return str(e)
     path = Path(repo_path).expanduser().resolve()
     
     if not path.exists():
@@ -476,8 +618,18 @@ def git_pull(repo_path: str, branch: str = "main") -> str:
         repo_path: Path to the local repository
         branch: Branch to pull (default: 'main')
     """
+    log_tool_call("git_pull", repo_path=repo_path, branch=branch)
+    try:
+        require_write_access("git_pull")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo_path = validate_path(repo_path)
+        branch = validate_branch_name(branch)
+    except ValueError as e:
+        return str(e)
     result = run_git(["pull", "origin", branch], cwd=repo_path)
-    
+
     if result["success"]:
         return f"✅ Pulled latest from origin/{branch}\n\n{result['output']}"
     else:
@@ -505,6 +657,23 @@ def create_branch(
     Returns:
         Success message or error
     """
+    log_tool_call("create_branch", repo_path=repo_path, branch_name=branch_name, from_branch=from_branch)
+    try:
+        require_write_access("create_branch")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo_path = validate_path(repo_path)
+    except ValueError as e:
+        return str(e)
+    try:
+        branch_name = validate_branch_name(branch_name)
+    except ValueError as e:
+        return str(e)
+    try:
+        from_branch = validate_branch_name(from_branch)
+    except ValueError as e:
+        return str(e)
     result = run_git(["checkout", "-b", branch_name, from_branch], cwd=repo_path)
 
     if result["success"]:
@@ -524,6 +693,11 @@ def list_branches(repo_path: str) -> str:
     Returns:
         List of branches with current branch marked
     """
+    log_tool_call("list_branches", repo_path=repo_path)
+    try:
+        repo_path = validate_path(repo_path)
+    except ValueError as e:
+        return str(e)
     result = run_git(["branch"], cwd=repo_path)
 
     if result["success"]:
@@ -544,6 +718,13 @@ def switch_branch(repo_path: str, branch_name: str) -> str:
     Returns:
         Success message or error
     """
+    log_tool_call("switch_branch", repo_path=repo_path, branch_name=branch_name)
+    try:
+        require_write_access("switch_branch")
+        repo_path = validate_path(repo_path)
+        branch_name = validate_branch_name(branch_name)
+    except (PermissionError, ValueError) as e:
+        return str(e)
     result = run_git(["checkout", branch_name], cwd=repo_path)
 
     if result["success"]:
@@ -569,6 +750,19 @@ def delete_branch(
     Returns:
         Success message or error
     """
+    log_tool_call("delete_branch", repo_path=repo_path, branch_name=branch_name, force=force)
+    try:
+        require_write_access("delete_branch")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo_path = validate_path(repo_path)
+    except ValueError as e:
+        return str(e)
+    try:
+        branch_name = validate_branch_name(branch_name)
+    except ValueError as e:
+        return str(e)
     flag = "-D" if force else "-d"
     result = run_git(["branch", flag, branch_name], cwd=repo_path)
 
@@ -594,6 +788,15 @@ def fork_repo(repo: str, clone: bool = False) -> str:
     Returns:
         Success message with fork info or error
     """
+    log_tool_call("fork_repo", repo=repo, clone=clone)
+    try:
+        require_write_access("fork_repo")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["repo", "fork", repo]
 
     if clone:
@@ -620,6 +823,12 @@ def sync_fork(repo_path: str) -> str:
     Returns:
         Success message or error
     """
+    log_tool_call("sync_fork", repo_path=repo_path)
+    try:
+        require_write_access("sync_fork")
+        repo_path = validate_path(repo_path)
+    except (PermissionError, ValueError) as e:
+        return str(e)
     result = run_gh(["repo", "sync"], cwd=repo_path)
 
     if result["success"]:
@@ -651,6 +860,15 @@ def create_issue(
     Returns:
         Issue URL or error
     """
+    log_tool_call("create_issue", repo=repo, title=title, body=body, labels=labels)
+    try:
+        require_write_access("create_issue")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["issue", "create", "--repo", repo, "--title", title]
     
     if body:
@@ -684,6 +902,11 @@ def list_issues(
     Returns:
         List of issues
     """
+    log_tool_call("list_issues", repo=repo, state=state, limit=limit)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit)]
     args.extend(["--json", "number,title,state,author,createdAt"])
 
@@ -722,6 +945,15 @@ def comment_on_issue(
     Returns:
         Success message or error
     """
+    log_tool_call("comment_on_issue", repo=repo, issue_number=issue_number, body=body)
+    try:
+        require_write_access("comment_on_issue")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["issue", "comment", str(issue_number), "--repo", repo, "--body", body]
 
     result = run_gh(args)
@@ -759,6 +991,15 @@ def create_pr(
     Returns:
         PR URL or error
     """
+    log_tool_call("create_pr", repo=repo, title=title, body=body, base=base, head=head, draft=draft)
+    try:
+        require_write_access("create_pr")
+        repo = validate_repo_name(repo)
+        base = validate_branch_name(base)
+        if head:
+            head = validate_branch_name(head)
+    except (PermissionError, ValueError) as e:
+        return str(e)
     args = ["pr", "create", "--repo", repo, "--title", title, "--base", base]
     
     if body:
@@ -792,6 +1033,11 @@ def list_prs(
         state: Filter by state - 'open', 'closed', 'merged', 'all'
         limit: Maximum number of PRs to list
     """
+    log_tool_call("list_prs", repo=repo, state=state, limit=limit)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["pr", "list", "--repo", repo, "--state", state, "--limit", str(limit)]
     args.extend(["--json", "number,title,state,author,createdAt"])
 
@@ -830,6 +1076,15 @@ def comment_on_pr(
     Returns:
         Success message or error
     """
+    log_tool_call("comment_on_pr", repo=repo, pr_number=pr_number, body=body)
+    try:
+        require_write_access("comment_on_pr")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["pr", "comment", str(pr_number), "--repo", repo, "--body", body]
 
     result = run_gh(args)
@@ -855,6 +1110,11 @@ def list_collaborators(repo: str) -> str:
     Returns:
         List of collaborator usernames
     """
+    log_tool_call("list_collaborators", repo=repo)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["api", f"repos/{repo}/collaborators", "--jq", ".[].login"])
 
     if result["success"]:
@@ -880,6 +1140,15 @@ def add_collaborator(
     Returns:
         Success message or error
     """
+    log_tool_call("add_collaborator", repo=repo, username=username, permission=permission)
+    try:
+        require_write_access("add_collaborator")
+        repo = validate_repo_name(repo)
+        username = validate_username(username)
+        if permission not in ("pull", "push", "admin"):
+            raise ValueError(f"⛔ Invalid permission: '{permission}'. Must be 'pull', 'push', or 'admin'.")
+    except (PermissionError, ValueError) as e:
+        return str(e)
     result = run_gh([
         "api", "-X", "PUT",
         f"repos/{repo}/collaborators/{username}",
@@ -909,6 +1178,13 @@ def get_file_contents(repo: str, path: str, ref: str = "main") -> str:
     Returns:
         File contents or error
     """
+    log_tool_call("get_file_contents", repo=repo, path=path, ref=ref)
+    try:
+        repo = validate_repo_name(repo)
+        path = validate_file_path(path)
+        ref = validate_branch_name(ref)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".content"])
 
     if result["success"]:
@@ -942,6 +1218,14 @@ def create_or_update_file(
     Returns:
         Success message with commit info or error
     """
+    log_tool_call("create_or_update_file", repo=repo, path=path, content=content, message=message, branch=branch)
+    try:
+        require_write_access("create_or_update_file")
+        repo = validate_repo_name(repo)
+        path = validate_file_path(path)
+        branch = validate_branch_name(branch)
+    except (PermissionError, ValueError) as e:
+        return str(e)
     encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
 
     # Try to get existing file SHA (needed for updates)
@@ -992,6 +1276,15 @@ def merge_pr(
     Returns:
         Success message or error
     """
+    log_tool_call("merge_pr", repo=repo, pr_number=pr_number, method=method, delete_branch=delete_branch)
+    try:
+        require_write_access("merge_pr")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["pr", "merge", str(pr_number), "--repo", repo, f"--{method}"]
 
     if delete_branch:
@@ -1024,6 +1317,15 @@ def review_pr(
     Returns:
         Success message or error
     """
+    log_tool_call("review_pr", repo=repo, pr_number=pr_number, action=action, body=body)
+    try:
+        require_write_access("review_pr")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["pr", "review", str(pr_number), "--repo", repo, f"--{action}"]
 
     if body:
@@ -1052,6 +1354,11 @@ def pr_diff(
     Returns:
         PR diff output or error
     """
+    log_tool_call("pr_diff", repo=repo, pr_number=pr_number)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["pr", "diff", str(pr_number), "--repo", repo])
 
     if result["success"]:
@@ -1083,6 +1390,11 @@ def create_gist(
     Returns:
         Gist URL or error
     """
+    log_tool_call("create_gist", filename=filename, content=content, description=description, public=public)
+    try:
+        require_write_access("create_gist")
+    except PermissionError as e:
+        return str(e)
     import tempfile
     
     # Write content to temp file
@@ -1124,6 +1436,11 @@ def list_workflows(repo: str) -> str:
     Returns:
         List of workflows in the repository
     """
+    log_tool_call("list_workflows", repo=repo)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["workflow", "list", "--repo", repo])
 
     if result["success"]:
@@ -1145,6 +1462,15 @@ def run_workflow(repo: str, workflow: str, ref: str = "main") -> str:
     Returns:
         Confirmation of workflow trigger
     """
+    log_tool_call("run_workflow", repo=repo, workflow=workflow, ref=ref)
+    try:
+        require_write_access("run_workflow")
+        repo = validate_repo_name(repo)
+        ref = validate_branch_name(ref)
+        if not re.match(r'^[a-zA-Z0-9._/-]+$', workflow):
+            raise ValueError(f"⛔ Invalid workflow name: '{workflow}'")
+    except (PermissionError, ValueError) as e:
+        return str(e)
     result = run_gh(["workflow", "run", workflow, "--repo", repo, "--ref", ref])
 
     if result["success"]:
@@ -1165,6 +1491,11 @@ def list_workflow_runs(repo: str, limit: int = 10) -> str:
     Returns:
         List of recent workflow runs
     """
+    log_tool_call("list_workflow_runs", repo=repo, limit=limit)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["run", "list", "--repo", repo, "--limit", str(limit)])
 
     if result["success"]:
@@ -1185,6 +1516,13 @@ def view_workflow_run(repo: str, run_id: str) -> str:
     Returns:
         Details of the workflow run
     """
+    log_tool_call("view_workflow_run", repo=repo, run_id=run_id)
+    try:
+        repo = validate_repo_name(repo)
+        if not re.match(r'^\d+$', run_id):
+            raise ValueError(f"⛔ Invalid run ID: '{run_id}'. Must be numeric.")
+    except ValueError as e:
+        return str(e)
     result = run_gh(["run", "view", run_id, "--repo", repo])
 
     if result["success"]:
@@ -1212,6 +1550,7 @@ def search_repos(
     Returns:
         List of matching repositories
     """
+    log_tool_call("search_repos", query=query, limit=limit)
     args = ["search", "repos", query, "--limit", str(limit)]
     
     result = run_gh(args)
@@ -1249,6 +1588,15 @@ def create_release(
     Returns:
         Release URL or error
     """
+    log_tool_call("create_release", repo=repo, tag=tag, title=title, notes=notes, draft=draft, prerelease=prerelease)
+    try:
+        require_write_access("create_release")
+    except PermissionError as e:
+        return str(e)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     args = ["release", "create", tag, "--repo", repo, "--title", title]
     
     if notes:
@@ -1280,6 +1628,11 @@ def list_releases(repo: str, limit: int = 10) -> str:
     Returns:
         List of releases or error
     """
+    log_tool_call("list_releases", repo=repo, limit=limit)
+    try:
+        repo = validate_repo_name(repo)
+    except ValueError as e:
+        return str(e)
     result = run_gh(["release", "list", "--repo", repo, "--limit", str(limit)])
 
     if result["success"]:
@@ -1298,11 +1651,55 @@ def list_releases(repo: str, limit: int = 10) -> str:
 if __name__ == "__main__":
     # Ensure work directory exists
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # Check if gh is installed
     if not shutil.which("gh"):
         print("⚠️  GitHub CLI (gh) not found!")
         print("   Install from: https://cli.github.com/")
         print("   Then run: gh auth login")
-    
-    mcp.run()
+
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+
+    if transport == "sse":
+        port = int(os.environ.get("MCP_PORT", "8080"))
+        api_key = os.environ.get("MCP_API_KEY", "")
+
+        if not api_key:
+            print("⚠️  MCP_API_KEY not set! Generate one with:")
+            print('   python -c "import secrets; print(secrets.token_urlsafe(32))"')
+            sys.exit(1)
+
+        logger.info(f"Starting SSE transport on port {port} (read_only={READ_ONLY})")
+
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+        import hmac
+        import uvicorn
+
+        class APIKeyAuthMiddleware(BaseHTTPMiddleware):
+            """Reject requests without a valid Bearer token."""
+            async def dispatch(self, request: Request, call_next):
+                if request.url.path in ("/health", "/healthz"):
+                    return await call_next(request)
+                auth = request.headers.get("Authorization", "")
+                expected = f"Bearer {api_key}"
+                # Timing-safe comparison to prevent key extraction via timing attacks
+                if not hmac.compare_digest(auth.encode(), expected.encode()):
+                    logger.warning(f"AUTH_REJECTED: {request.client.host} — invalid key")
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+                return await call_next(request)
+
+        # Get the SSE app from FastMCP and wrap with auth
+        sse_app = mcp.sse_app()
+        sse_app.add_middleware(APIKeyAuthMiddleware)
+
+        print(f"🚀 MCP Server (SSE) running on http://127.0.0.1:{port}")
+        print(f"   Endpoint: http://localhost:{port}/sse")
+        print(f"   Read-only: {READ_ONLY}")
+        uvicorn.run(sse_app, host="127.0.0.1", port=port, log_level="info")
+    else:
+        logger.info(f"Starting stdio transport (read_only={READ_ONLY})")
+        mcp.run()
